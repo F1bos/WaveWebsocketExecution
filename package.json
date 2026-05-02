@@ -141,6 +141,31 @@
           "type": "boolean",
           "default": true,
           "description": "Show notification popup when scripts are sent to Roblox clients"
+        },
+        "luaWebSocket.agentApiEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start a local HTTP API for AI agents to inspect logs and execute scripts"
+        },
+        "luaWebSocket.agentApiPort": {
+          "type": "number",
+          "default": 61418,
+          "description": "Local HTTP API port for AI agents"
+        },
+        "luaWebSocket.agentLogEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write structured agent-readable logs to a JSONL file"
+        },
+        "luaWebSocket.agentLogFilePath": {
+          "type": "string",
+          "default": ".wave/logs/current.ndjson",
+          "description": "Workspace-relative or absolute path for structured JSONL logs"
+        },
+        "luaWebSocket.agentLogMaxEntries": {
+          "type": "number",
+          "default": 1000,
+          "description": "Maximum number of recent log entries kept in memory for the agent HTTP API"
         }
       }
     }

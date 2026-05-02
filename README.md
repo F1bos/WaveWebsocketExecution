@@ -71,6 +71,12 @@ All output from connected clients appears in the "Lua WebSocket Server" output c
 
 Access the output panel via: **View** → **Output** → **Lua WebSocket Server**
 
+### Agent Access
+
+The extension also writes structured agent-readable logs to `.wave/logs/current.ndjson` and starts a local HTTP API at `http://127.0.0.1:61418`.
+
+AI agents can use this API to inspect status, list connected clients, read recent logs, and execute Lua scripts. See [`AGENT_API.md`](AGENT_API.md) for endpoint documentation and the recommended workflow.
+
 ## Configuration
 
 Open VS Code settings (`Ctrl+,` or `Cmd+,`) and search for "Lua WebSocket":
