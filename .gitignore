@@ -1,1 +1,4 @@
 /node_modules
+/mcp-server/node_modules
+*.vsix
+.wave/

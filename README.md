@@ -75,7 +75,10 @@ Access the output panel via: **View** → **Output** → **Lua WebSocket Server*
 
 The extension also writes structured agent-readable logs to `.wave/logs/current.ndjson` and starts a local HTTP API at `http://127.0.0.1:61418`.
 
-AI agents can use this API to inspect status, list connected clients, read recent logs, and execute Lua scripts. See [`AGENT_API.md`](AGENT_API.md) for endpoint documentation and the recommended workflow.
+Two ways for AI agents to drive the extension:
+
+- **MCP server** (recommended for Claude Code / Cursor / Claude Desktop) — see [`mcp-server/README.md`](mcp-server/README.md). One-time setup: `cd mcp-server && npm install`, then register the stdio server in your agent client. The MCP exposes nine `wave_*` tools covering status, logs, ad-hoc execution, synchronous `execute_and_wait`, and the watch-reload long-poll.
+- **HTTP API** — direct endpoints for curl / scripts / non-MCP clients. See [`AGENT_API.md`](AGENT_API.md) for the full spec and three workflow recipes (one-shot debug, watch-reload for autoexec development, and polling).
 
 ## Configuration
 

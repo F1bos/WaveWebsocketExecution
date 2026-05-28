@@ -5,6 +5,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { EventEmitter } = require('events');
+
+const WAVE_MARKER_PREFIX = '__WAVE_DONE_';
+const WAVE_ERROR_PREFIX = '[WAVE_ERR]';
 
 const ClientEvent = {
     Identify: "client/identify",
@@ -43,6 +47,14 @@ class WebSocketManager {
         this.LogEntries = [];
         this.MaxLogEntries = 1000;
         this.LogSequence = 0;
+
+        this.Events = new EventEmitter();
+        this.Events.setMaxListeners(0);
+
+        this.Sessions = new Map();
+        this.PendingExecutions = new Map();
+        this.ExecuteAndWaitTimeoutMs = 15000;
+        this.WaitForReloadTimeoutMs = 30000;
     }
 
     Initialize(Context) {
@@ -61,6 +73,8 @@ class WebSocketManager {
     InitializeFileLogging(Context) {
         const config = vscode.workspace.getConfiguration('luaWebSocket');
         this.MaxLogEntries = Math.max(1, config.get('agentLogMaxEntries', 1000));
+        this.ExecuteAndWaitTimeoutMs = Math.max(1000, config.get('executeAndWaitTimeoutMs', 15000));
+        this.WaitForReloadTimeoutMs = Math.max(1000, config.get('waitForReloadTimeoutMs', 30000));
 
         if (!config.get('agentLogEnabled', true)) {
             return;
@@ -100,6 +114,25 @@ class WebSocketManager {
         this.OutputChannel.appendLine(FormattedMessage);
         console.log(FormattedMessage);
         this.StoreLogEntry(LogEntry);
+        this.Events.emit('log', LogEntry);
+        this.CheckExecutionMarker(LogEntry);
+    }
+
+    CheckExecutionMarker(LogEntry) {
+        if (this.PendingExecutions.size === 0) return;
+        const message = LogEntry.message || '';
+        const idx = message.indexOf(WAVE_MARKER_PREFIX);
+        if (idx === -1) return;
+
+        const tail = message.slice(idx + WAVE_MARKER_PREFIX.length);
+        const match = tail.match(/^([0-9a-fA-F-]+)/);
+        if (!match) return;
+
+        const executionId = match[1];
+        const pending = this.PendingExecutions.get(executionId);
+        if (!pending) return;
+
+        pending.resolve({ markerEntry: LogEntry });
     }
 
     StoreLogEntry(LogEntry) {
@@ -204,12 +237,12 @@ class WebSocketManager {
 
                 if (clientsContains(Client)) {
                     this.Clients.set(Client, Identity);
-                    this.OnUpdate(Client._id, Identity);
+                    this.OnUpdate(Client, Identity);
                     break;
                 }
                 this.Clients.set(Client, Identity);
 
-                this.OnConnect(Client._id, Identity);
+                this.OnConnect(Client, Identity);
                 break;
             }
 
@@ -244,7 +277,8 @@ class WebSocketManager {
         }
     }
 
-    OnConnect(uniqueId, identity) {
+    OnConnect(Client, identity) {
+        var uniqueId = Client._id;
         var id = identity && identity.player && identity.player.name ? identity.player.id : "0";
         var player = identity && identity.player && identity.player.id ? identity.player.name : "Unknown";
         var game = identity && identity.game && identity.game.name ? identity.game.name : "Unknown";
@@ -252,15 +286,65 @@ class WebSocketManager {
         // Auto-select new clients by default
         this.SelectedClients.add(uniqueId);
 
-        this.LogMessage(`Connected ${uniqueId} -> Player: ${player}(${id}) Game: ${game}`, "CLIENT");
+        const session = this.RegisterSession(Client, identity);
+
+        this.LogMessage(`Connected ${uniqueId} -> Player: ${player}(${id}) Game: ${game}`, "CLIENT", {
+            clientId: uniqueId,
+            sessionId: session ? session.sessionId : null,
+            playerId: session ? session.playerId : id,
+            player,
+            game,
+            generation: session ? session.generation : null
+        });
+
+        if (session) {
+            this.Events.emit('session:new', session);
+        }
     }
 
-    OnUpdate(uniqueId, identity) {
+    OnUpdate(Client, identity) {
+        var uniqueId = Client._id;
         var id = identity && identity.player && identity.player.name ? identity.player.id : "Unknown";
         var player = identity && identity.player && identity.player.id ? identity.player.name : "Unknown";
         var game = identity && identity.game && identity.game.name ? identity.game.name : "Unknown";
 
-        this.LogMessage(`Updated ${uniqueId} -> Player: ${player}(${id}) Game: ${game}`, "CLIENT");
+        const session = this.RegisterSession(Client, identity);
+
+        this.LogMessage(`Updated ${uniqueId} -> Player: ${player}(${id}) Game: ${game}`, "CLIENT", {
+            clientId: uniqueId,
+            sessionId: session ? session.sessionId : null,
+            playerId: session ? session.playerId : id,
+            player,
+            game
+        });
+    }
+
+    RegisterSession(Client, identity) {
+        const playerId = identity && identity.player && identity.player.id != null
+            ? String(identity.player.id)
+            : null;
+
+        if (!playerId) {
+            return null;
+        }
+
+        const existing = this.Sessions.get(playerId);
+        const generation = existing ? existing.generation + 1 : 1;
+        const session = {
+            sessionId: crypto.randomUUID(),
+            playerId,
+            generation,
+            clientId: Client._id,
+            identity,
+            firstSeenAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            closed: false
+        };
+
+        this.Sessions.set(playerId, session);
+        Client._sessionId = session.sessionId;
+        Client._playerId = playerId;
+        return session;
     }
 
     OnOutput(output, Client) {
@@ -272,6 +356,7 @@ class WebSocketManager {
         this.LogMessage(output.message, output.level, {
             type: output.type,
             clientId: Client ? Client._id : null,
+            sessionId: Client ? Client._sessionId || null : null,
             player,
             playerId,
             game
@@ -292,7 +377,20 @@ class WebSocketManager {
         var player = identity && identity.player && identity.player.id ? identity.player.name : "Unknown";
         var game = identity && identity.game && identity.game.name ? identity.game.name : "Unknown";
 
-        this.LogMessage(`Disconnected ${Client._id} -> Player: ${player}(${id})`, "CLIENT");
+        this.LogMessage(`Disconnected ${Client._id} -> Player: ${player}(${id})`, "CLIENT", {
+            clientId: Client._id,
+            sessionId: Client._sessionId || null,
+            playerId: Client._playerId || null
+        });
+
+        if (Client._playerId) {
+            const session = this.Sessions.get(Client._playerId);
+            if (session && session.sessionId === Client._sessionId) {
+                session.closed = true;
+                session.lastSeenAt = new Date().toISOString();
+            }
+        }
+
         this.Clients.delete(Client);
         this.SelectedClients.delete(Client._id); // Remove from selected clients
         this.ConnectedClients--;
@@ -371,12 +469,13 @@ class WebSocketManager {
         if (!this.ConnectedClients) {
             const error = "No Roblox clients connected";
             if (showUi) vscode.window.showErrorMessage(error);
-            return { ok: false, error, sent: 0, failed: 0 };
+            return { ok: false, error, sent: 0, failed: 0, targets: [] };
         }
 
         let sent = 0;
         let failed = 0;
         const toPrune = [];
+        const targets = [];
         const packet = {
             op: "client/onDidTextDocumentExecute",
             data: {
@@ -400,6 +499,11 @@ class WebSocketManager {
             try {
                 ws.send(payload);
                 sent++;
+                targets.push({
+                    clientId: ws._id,
+                    sessionId: ws._sessionId || null,
+                    playerId: ws._playerId || null
+                });
             } catch (e) {
                 failed++;
                 this.LogMessage(`Script ${ws._id}: ${e.message}`, 'ERROR');
@@ -433,7 +537,8 @@ class WebSocketManager {
                 selectionMode: this.SelectionMode,
                 selectedClients: Array.from(this.SelectedClients),
                 scriptName: ScriptName || "Script",
-                chars: ScriptContent.length
+                chars: ScriptContent.length,
+                targets
             };
         } else {
             let error;
@@ -444,8 +549,99 @@ class WebSocketManager {
             }
 
             if (showUi) vscode.window.showErrorMessage(error);
-            return { ok: false, error, sent, failed };
+            return { ok: false, error, sent, failed, targets: [] };
         }
+    }
+
+    async SendScriptAndWait(ScriptContent, ScriptName = null, Options = {}) {
+        const timeoutMs = Options.timeoutMs && Options.timeoutMs > 0
+            ? Options.timeoutMs
+            : this.ExecuteAndWaitTimeoutMs;
+
+        const executionId = crypto.randomUUID();
+        const wrapped = this.WrapForExecuteAndWait(ScriptContent, executionId);
+        const startLogId = this.LogSequence;
+        const startedAt = Date.now();
+
+        const sendResult = this.SendScript(wrapped, ScriptName, { showUi: false });
+        if (!sendResult.ok) {
+            return {
+                ...sendResult,
+                executionId,
+                markerSeen: false,
+                timedOut: false,
+                durationMs: 0,
+                logs: []
+            };
+        }
+
+        const targetClientIds = new Set(sendResult.targets.map((t) => t.clientId));
+        const targetSessionIds = new Set(sendResult.targets.map((t) => t.sessionId).filter(Boolean));
+
+        const markerEntry = await new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                this.PendingExecutions.delete(executionId);
+                resolve(null);
+            }, timeoutMs);
+
+            this.PendingExecutions.set(executionId, {
+                resolve: (payload) => {
+                    clearTimeout(timer);
+                    this.PendingExecutions.delete(executionId);
+                    resolve(payload.markerEntry);
+                }
+            });
+        });
+
+        const durationMs = Date.now() - startedAt;
+        const logs = this.LogEntries.filter((entry) => {
+            if (entry.id <= startLogId) return false;
+            if (markerEntry && entry.id > markerEntry.id) return false;
+            if (entry.clientId && targetClientIds.size > 0) {
+                if (!targetClientIds.has(entry.clientId) && !(entry.sessionId && targetSessionIds.has(entry.sessionId))) {
+                    return false;
+                }
+            }
+            return true;
+        });
+
+        const errorEntries = logs.filter((entry) =>
+            String(entry.message || '').includes(WAVE_ERROR_PREFIX)
+        );
+
+        return {
+            ok: !!markerEntry,
+            executionId,
+            markerSeen: !!markerEntry,
+            timedOut: !markerEntry,
+            durationMs,
+            sent: sendResult.sent,
+            failed: sendResult.failed,
+            targets: sendResult.targets,
+            scriptName: sendResult.scriptName,
+            chars: ScriptContent.length,
+            logs,
+            errors: errorEntries.map((entry) => ({
+                id: entry.id,
+                message: String(entry.message).split(WAVE_ERROR_PREFIX).slice(1).join(WAVE_ERROR_PREFIX),
+                clientId: entry.clientId,
+                sessionId: entry.sessionId
+            }))
+        };
+    }
+
+    WrapForExecuteAndWait(UserScript, ExecutionId) {
+        const marker = `${WAVE_MARKER_PREFIX}${ExecutionId}__`;
+        const errPrefix = WAVE_ERROR_PREFIX;
+        return [
+            'do',
+            '    local __wave_ok, __wave_err = pcall(function()',
+            UserScript,
+            '    end)',
+            `    if not __wave_ok then warn("${errPrefix}" .. tostring(__wave_err)) end`,
+            `    print("${marker}")`,
+            'end'
+        ].join('\n');
     }
 
     StartAgentApi() {
@@ -514,6 +710,9 @@ class WebSocketManager {
                 case 'POST /scripts/execute-text':
                     return this.WriteAgentJson(Response, 200, await this.AgentExecuteText(Request));
 
+                case 'POST /scripts/execute-and-wait':
+                    return this.WriteAgentJson(Response, 200, await this.AgentExecuteAndWait(Request));
+
                 case 'POST /scripts/execute-file':
                     return this.WriteAgentJson(Response, 200, await this.AgentExecuteFile(Request));
 
@@ -522,6 +721,15 @@ class WebSocketManager {
 
                 case 'POST /commands/execute-current':
                     return this.WriteAgentJson(Response, 200, this.AgentExecuteCurrentScript());
+
+                case 'GET /sessions':
+                    return this.WriteAgentJson(Response, 200, this.GetAgentSessions());
+
+                case 'GET /sessions/wait-reload':
+                    return this.WriteAgentJson(Response, 200, await this.AgentWaitForReload(RequestUrl));
+
+                case 'GET /logs/since-session':
+                    return this.WriteAgentJson(Response, 200, this.GetAgentLogsBySession(RequestUrl));
 
                 default:
                     return this.WriteAgentJson(Response, 404, {
@@ -575,10 +783,14 @@ class WebSocketManager {
             endpoints: [
                 'GET /status',
                 'GET /clients',
-                'GET /logs?limit=100&level=ERROR&sinceId=0',
+                'GET /logs?limit=100&level=ERROR&sinceId=0&clientId=...&sessionId=...',
+                'GET /logs/since-session?sessionId=...&limit=200',
+                'GET /sessions',
+                'GET /sessions/wait-reload?playerId=...&sinceGeneration=N&timeoutMs=30000',
                 'GET /config',
                 'POST /logs/clear',
                 'POST /scripts/execute-text {"text":"print(\\"hi\\")","name":"optional.lua"}',
+                'POST /scripts/execute-and-wait {"text":"print(\\"hi\\")","timeoutMs":15000}',
                 'POST /scripts/execute-file {"path":"relative/or/absolute.lua"}',
                 'POST /scripts/execute-specific',
                 'POST /commands/execute-current'
@@ -609,6 +821,7 @@ class WebSocketManager {
                 maxBufferedEntries: this.MaxLogEntries,
                 lastId: this.LogSequence
             },
+            sessions: this.GetAgentSessions().sessions,
             clients: this.GetAgentClients()
         };
     }
@@ -622,7 +835,9 @@ class WebSocketManager {
             agentApiPort: config.get('agentApiPort', 61418),
             agentLogEnabled: config.get('agentLogEnabled', true),
             agentLogFilePath: this.LogFilePath,
-            specificScriptPath: config.get('specificScriptPath', '')
+            specificScriptPath: config.get('specificScriptPath', ''),
+            executeAndWaitTimeoutMs: this.ExecuteAndWaitTimeoutMs,
+            waitForReloadTimeoutMs: this.WaitForReloadTimeoutMs
         };
     }
 
@@ -653,6 +868,8 @@ class WebSocketManager {
         const sinceId = parseInt(RequestUrl.searchParams.get('sinceId') || '0', 10);
         const level = RequestUrl.searchParams.get('level');
         const clientId = RequestUrl.searchParams.get('clientId');
+        const sessionId = RequestUrl.searchParams.get('sessionId');
+        const playerId = RequestUrl.searchParams.get('playerId');
 
         let entries = this.LogEntries;
 
@@ -668,6 +885,14 @@ class WebSocketManager {
             entries = entries.filter((entry) => entry.clientId === clientId);
         }
 
+        if (sessionId) {
+            entries = entries.filter((entry) => entry.sessionId === sessionId);
+        }
+
+        if (playerId) {
+            entries = entries.filter((entry) => String(entry.playerId) === String(playerId));
+        }
+
         entries = entries.slice(-limit);
 
         return {
@@ -675,6 +900,82 @@ class WebSocketManager {
             logFilePath: this.LogFilePath,
             lastId: this.LogSequence,
             entries
+        };
+    }
+
+    GetAgentLogsBySession(RequestUrl) {
+        const sessionId = RequestUrl.searchParams.get('sessionId');
+        if (!sessionId) {
+            return { ok: false, error: "Missing 'sessionId' query parameter." };
+        }
+        return this.GetAgentLogs(RequestUrl);
+    }
+
+    GetAgentSessions() {
+        const sessions = [];
+        for (const [playerId, session] of this.Sessions) {
+            sessions.push({
+                playerId,
+                sessionId: session.sessionId,
+                generation: session.generation,
+                clientId: session.clientId,
+                identity: session.identity,
+                firstSeenAt: session.firstSeenAt,
+                lastSeenAt: session.lastSeenAt,
+                closed: session.closed
+            });
+        }
+        return { ok: true, sessions };
+    }
+
+    AgentWaitForReload(RequestUrl) {
+        const playerId = RequestUrl.searchParams.get('playerId');
+        const sinceGenerationRaw = RequestUrl.searchParams.get('sinceGeneration');
+        const sinceGeneration = sinceGenerationRaw == null ? null : parseInt(sinceGenerationRaw, 10);
+        const timeoutRaw = RequestUrl.searchParams.get('timeoutMs');
+        const timeoutMs = timeoutRaw
+            ? Math.max(1000, Math.min(parseInt(timeoutRaw, 10) || 0, 600000))
+            : this.WaitForReloadTimeoutMs;
+
+        if (playerId) {
+            const existing = this.Sessions.get(String(playerId));
+            if (existing && sinceGeneration != null && existing.generation > sinceGeneration && !existing.closed) {
+                return Promise.resolve(this.SessionToReloadResponse(existing, false));
+            }
+        }
+
+        return new Promise((resolve) => {
+            const onSession = (session) => {
+                if (playerId && session.playerId !== String(playerId)) return;
+                if (sinceGeneration != null && session.generation <= sinceGeneration) return;
+                cleanup();
+                resolve(this.SessionToReloadResponse(session, false));
+            };
+
+            const timer = setTimeout(() => {
+                cleanup();
+                resolve({ ok: true, timedOut: true, playerId: playerId || null, sinceGeneration });
+            }, timeoutMs);
+
+            const cleanup = () => {
+                clearTimeout(timer);
+                this.Events.off('session:new', onSession);
+            };
+
+            this.Events.on('session:new', onSession);
+        });
+    }
+
+    SessionToReloadResponse(session, timedOut) {
+        return {
+            ok: true,
+            timedOut,
+            sessionId: session.sessionId,
+            playerId: session.playerId,
+            generation: session.generation,
+            clientId: session.clientId,
+            identity: session.identity,
+            firstSeenAt: session.firstSeenAt
         };
     }
 
@@ -704,6 +1005,19 @@ class WebSocketManager {
         }
 
         return this.SendScript(String(ScriptContent), ScriptName, { showUi: false });
+    }
+
+    async AgentExecuteAndWait(Request) {
+        const Body = await this.ReadAgentBody(Request);
+        const ScriptContent = Body.text || Body.script || Body.content;
+        const ScriptName = Body.name || 'Agent Script';
+        const TimeoutMs = Body.timeoutMs;
+
+        if (!ScriptContent || String(ScriptContent).trim().length === 0) {
+            return { ok: false, error: 'Missing non-empty script text. Use {"text":"..."}.' };
+        }
+
+        return this.SendScriptAndWait(String(ScriptContent), ScriptName, { timeoutMs: TimeoutMs });
     }
 
     async AgentExecuteFile(Request) {

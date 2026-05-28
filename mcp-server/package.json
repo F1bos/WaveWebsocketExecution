@@ -1,0 +1,13 @@
+{
+  "name": "wave-mcp",
+  "version": "0.1.0",
+  "description": "MCP server bridging AI agents to the Wave WebSocket VS Code extension",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "wave-mcp": "./index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}

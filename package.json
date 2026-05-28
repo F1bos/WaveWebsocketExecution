@@ -166,6 +166,16 @@
           "type": "number",
           "default": 1000,
           "description": "Maximum number of recent log entries kept in memory for the agent HTTP API"
+        },
+        "luaWebSocket.executeAndWaitTimeoutMs": {
+          "type": "number",
+          "default": 15000,
+          "description": "Default timeout (ms) for /scripts/execute-and-wait requests when none is supplied in the body"
+        },
+        "luaWebSocket.waitForReloadTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "Default timeout (ms) for /sessions/wait-reload long-poll requests"
         }
       }
     }
