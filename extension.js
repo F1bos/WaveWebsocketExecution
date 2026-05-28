@@ -609,6 +609,9 @@ class WebSocketManager {
             String(entry.message || '').includes(WAVE_ERROR_PREFIX)
         );
 
+        const verbose = Options.verbose === true;
+        const compact = verbose ? null : this.CompactLogEntries(logs);
+
         return {
             ok: !!markerEntry,
             executionId,
@@ -620,7 +623,8 @@ class WebSocketManager {
             targets: sendResult.targets,
             scriptName: sendResult.scriptName,
             chars: ScriptContent.length,
-            logs,
+            sessions: verbose ? undefined : compact.sessions,
+            logs: verbose ? logs : compact.entries,
             errors: errorEntries.map((entry) => ({
                 id: entry.id,
                 message: String(entry.message).split(WAVE_ERROR_PREFIX).slice(1).join(WAVE_ERROR_PREFIX),
@@ -783,8 +787,8 @@ class WebSocketManager {
             endpoints: [
                 'GET /status',
                 'GET /clients',
-                'GET /logs?limit=100&level=ERROR&sinceId=0&clientId=...&sessionId=...',
-                'GET /logs/since-session?sessionId=...&limit=200',
+                'GET /logs?limit=100&level=ERROR&sinceId=0&clientId=...&sessionId=...&verbose=0',
+                'GET /logs/since-session?sessionId=...&limit=200&verbose=0',
                 'GET /sessions',
                 'GET /sessions/wait-reload?playerId=...&sinceGeneration=N&timeoutMs=30000',
                 'GET /config',
@@ -870,6 +874,8 @@ class WebSocketManager {
         const clientId = RequestUrl.searchParams.get('clientId');
         const sessionId = RequestUrl.searchParams.get('sessionId');
         const playerId = RequestUrl.searchParams.get('playerId');
+        const verboseRaw = RequestUrl.searchParams.get('verbose');
+        const verbose = verboseRaw === '1' || verboseRaw === 'true';
 
         let entries = this.LogEntries;
 
@@ -895,12 +901,51 @@ class WebSocketManager {
 
         entries = entries.slice(-limit);
 
+        if (verbose) {
+            return {
+                ok: true,
+                logFilePath: this.LogFilePath,
+                lastId: this.LogSequence,
+                entries
+            };
+        }
+
+        const compact = this.CompactLogEntries(entries);
         return {
             ok: true,
             logFilePath: this.LogFilePath,
             lastId: this.LogSequence,
-            entries
+            sessions: compact.sessions,
+            entries: compact.entries
         };
+    }
+
+    CompactLogEntries(entries) {
+        const sessions = {};
+        const compactEntries = entries.map((entry) => {
+            const out = {
+                id: entry.id,
+                t: entry.time,
+                lvl: entry.level,
+                m: entry.message
+            };
+            if (entry.sessionId) {
+                out.s = entry.sessionId;
+                if (!sessions[entry.sessionId]) {
+                    sessions[entry.sessionId] = {
+                        player: entry.player,
+                        playerId: entry.playerId,
+                        game: entry.game,
+                        clientId: entry.clientId
+                    };
+                }
+            } else if (entry.clientId) {
+                out.c = entry.clientId;
+            }
+            if (entry.source) out.src = entry.source;
+            return out;
+        });
+        return { sessions, entries: compactEntries };
     }
 
     GetAgentLogsBySession(RequestUrl) {
@@ -1012,12 +1057,13 @@ class WebSocketManager {
         const ScriptContent = Body.text || Body.script || Body.content;
         const ScriptName = Body.name || 'Agent Script';
         const TimeoutMs = Body.timeoutMs;
+        const Verbose = Body.verbose === true;
 
         if (!ScriptContent || String(ScriptContent).trim().length === 0) {
             return { ok: false, error: 'Missing non-empty script text. Use {"text":"..."}.' };
         }
 
-        return this.SendScriptAndWait(String(ScriptContent), ScriptName, { timeoutMs: TimeoutMs });
+        return this.SendScriptAndWait(String(ScriptContent), ScriptName, { timeoutMs: TimeoutMs, verbose: Verbose });
     }
 
     async AgentExecuteFile(Request) {

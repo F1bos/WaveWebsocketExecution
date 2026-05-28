@@ -75,7 +75,7 @@ const TOOLS = [
     },
     {
         name: 'wave_get_logs',
-        description: 'Fetch recent in-memory log entries (player prints, warnings, errors, server events). Supports filters. Use `sinceId` from a previous response to only fetch new entries.',
+        description: 'Fetch recent in-memory log entries (player prints, warnings, errors, server events). Compact format by default: each entry is `{id, t, lvl, m, s?, c?}` and a top-level `sessions` map holds player/game per sessionId. Pass `verbose: true` for the legacy fully-expanded format. Use `sinceId` from a previous response to only fetch new entries.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -84,7 +84,8 @@ const TOOLS = [
                 level: { type: 'string', description: 'Filter by level e.g. ERROR, WARNING, PRINT, INFO, DEBUG, CLIENT, AGENT, SERVER.' },
                 clientId: { type: 'string', description: 'Filter by Wave-internal client id (UUID).' },
                 sessionId: { type: 'string', description: 'Filter by session id (one Roblox lifecycle, see wave_wait_for_reload).' },
-                playerId: { type: 'string', description: 'Filter by Roblox player id (UserId).' }
+                playerId: { type: 'string', description: 'Filter by Roblox player id (UserId).' },
+                verbose: { type: 'boolean', description: 'Return legacy fully-expanded entries (default false).' }
             },
             additionalProperties: false
         }
@@ -121,13 +122,14 @@ const TOOLS = [
     },
     {
         name: 'wave_execute_and_wait',
-        description: 'Send a Lua script and synchronously wait until it completes. The script is wrapped in pcall and a unique completion marker. Returns logs captured during execution plus any pcall errors. Use this for one-shot scripts where you need the result. NOT suitable for long-running scripts that never return (UI loops, autoexec) — use wave_execute_text + wave_wait_for_reload for those.',
+        description: 'Send a Lua script and synchronously wait until it completes. The script is wrapped in pcall and a unique completion marker. Returns logs captured during execution (compact format with `sessions` map and `{id, t, lvl, m, s?}` entries) plus any pcall errors. Pass `verbose: true` for legacy fully-expanded log entries. Use this for one-shot scripts where you need the result. NOT suitable for long-running scripts that never return (UI loops, autoexec) — use wave_execute_text + wave_wait_for_reload for those.',
         inputSchema: {
             type: 'object',
             properties: {
                 text: { type: 'string', description: 'Lua source code to execute.' },
                 name: { type: 'string', description: 'Optional display name.' },
-                timeoutMs: { type: 'integer', minimum: 500, maximum: 600000, description: 'Override default timeout (ms).' }
+                timeoutMs: { type: 'integer', minimum: 500, maximum: 600000, description: 'Override default timeout (ms).' },
+                verbose: { type: 'boolean', description: 'Return legacy fully-expanded log entries (default false).' }
             },
             required: ['text'],
             additionalProperties: false
@@ -153,14 +155,15 @@ const TOOLS = [
     },
     {
         name: 'wave_get_session_logs',
-        description: 'Read all logs belonging to a specific session (one Roblox lifecycle). Pair with wave_wait_for_reload to inspect output of the freshly reloaded autoexec script without noise from the previous session.',
+        description: 'Read all logs belonging to a specific session (one Roblox lifecycle). Pair with wave_wait_for_reload to inspect output of the freshly reloaded autoexec script without noise from the previous session. Returns compact format by default; pass `verbose: true` for legacy fully-expanded entries.',
         inputSchema: {
             type: 'object',
             properties: {
                 sessionId: { type: 'string', description: 'Session id from wave_wait_for_reload or wave_list_sessions.' },
                 limit: { type: 'integer', minimum: 1, maximum: 1000, description: 'Max entries (default 200).' },
                 sinceId: { type: 'integer', description: 'Only entries with id greater than this.' },
-                level: { type: 'string', description: 'Filter by level.' }
+                level: { type: 'string', description: 'Filter by level.' },
+                verbose: { type: 'boolean', description: 'Return legacy fully-expanded entries (default false).' }
             },
             required: ['sessionId'],
             additionalProperties: false
@@ -186,7 +189,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return asToolResult(await callApi('GET', '/clients'));
 
         case 'wave_get_logs':
-            return asToolResult(await callApi('GET', '/logs', { query: args }));
+            return asToolResult(await callApi('GET', '/logs', {
+                query: {
+                    ...args,
+                    verbose: args.verbose ? '1' : undefined
+                }
+            }));
 
         case 'wave_clear_logs':
             return asToolResult(await callApi('POST', '/logs/clear'));
@@ -205,7 +213,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const timeoutMs = args.timeoutMs;
             const requestTimeoutMs = timeoutMs ? timeoutMs + 5000 : DEFAULT_TIMEOUT_MS;
             return asToolResult(await callApi('POST', '/scripts/execute-and-wait', {
-                body: { text: args.text, name: args.name, timeoutMs },
+                body: { text: args.text, name: args.name, timeoutMs, verbose: args.verbose === true },
                 timeoutMs: requestTimeoutMs
             }));
         }
@@ -231,7 +239,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     sessionId: args.sessionId,
                     limit: args.limit ?? 200,
                     sinceId: args.sinceId,
-                    level: args.level
+                    level: args.level,
+                    verbose: args.verbose ? '1' : undefined
                 }
             }));
 
